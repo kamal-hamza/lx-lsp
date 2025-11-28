@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/kamal-hamza/lx-cli/pkg/vault"
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
@@ -25,10 +26,11 @@ type NoteHeader struct {
 }
 
 type LanguageServer struct {
-	vault *vault.Vault
-	index *Index
-	conn  jsonrpc2.Conn
-	mu    sync.RWMutex
+	vault   *vault.Vault
+	index   *Index
+	conn    jsonrpc2.Conn
+	watcher *fsnotify.Watcher // <--- Added Watcher
+	mu      sync.RWMutex
 }
 
 type Index struct {
@@ -53,6 +55,12 @@ func (i *Index) Set(slug string, header *NoteHeader) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.notes[slug] = header
+}
+
+func (i *Index) Delete(slug string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	delete(i.notes, slug)
 }
 
 func (i *Index) Count() int {
@@ -106,9 +114,61 @@ func (s *LanguageServer) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to build initial index: %w", err)
 	}
 
+	// --- Start File Watcher ---
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("failed to create watcher: %w", err)
+	}
+	s.watcher = watcher
+	defer s.watcher.Close()
+
+	// Watch Notes directory
+	if err := s.watcher.Add(s.vault.NotesPath); err != nil {
+		return fmt.Errorf("failed to watch notes directory: %w", err)
+	}
+
+	// Handle events in background
+	go s.handleFileEvents(ctx)
+	// --------------------------
+
 	// Wait for connection to close
 	<-conn.Done()
 	return conn.Err()
+}
+
+// handleFileEvents watches for changes in the notes directory
+func (s *LanguageServer) handleFileEvents(ctx context.Context) {
+	for {
+		select {
+		case event, ok := <-s.watcher.Events:
+			if !ok {
+				return
+			}
+			// Only care about .tex files
+			if strings.HasSuffix(event.Name, ".tex") {
+				// Update index for this specific file
+				s.updateIndexForFile(event.Name)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// updateIndexForFile updates a single entry in the index
+func (s *LanguageServer) updateIndexForFile(path string) {
+	// 1. Check if file was deleted
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		slug := s.parseFilenameToSlug(filepath.Base(path))
+		s.index.Delete(slug)
+		return
+	}
+
+	// 2. Parse and Update
+	header, err := s.parseNoteHeader(filepath.Base(path))
+	if err == nil {
+		s.index.Set(header.Slug, header)
+	}
 }
 
 // RebuildIndex scans all notes and rebuilds the index

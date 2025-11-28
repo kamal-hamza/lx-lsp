@@ -3,6 +3,7 @@ module github.com/kamal-hamza/lx-lsp
 go 1.25.4
 
 require (
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/kamal-hamza/lx-cli v0.1.2
 	go.lsp.dev/jsonrpc2 v0.10.0
 	go.lsp.dev/protocol v0.12.0

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 
@@ -23,6 +24,7 @@ func (s *LanguageServer) Initialize(ctx context.Context, params *protocol.Initia
 			},
 			DefinitionProvider: true,
 			HoverProvider:      true,
+			RenameProvider:     true, // <--- Enabled Rename
 			DocumentLinkProvider: &protocol.DocumentLinkOptions{
 				ResolveProvider: false,
 			},
@@ -32,6 +34,39 @@ func (s *LanguageServer) Initialize(ctx context.Context, params *protocol.Initia
 			Version: "0.1.0",
 		},
 	}, nil
+}
+
+// Handle Rename request
+func (s *LanguageServer) Rename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
+	if !s.IsManaged(params.TextDocument.URI) {
+		return nil, nil
+	}
+
+	// 1. Identify the slug being renamed
+	path := uriToPath(params.TextDocument.URI)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+
+	oldSlug := s.getSlugAtPosition(string(content), params.Position)
+	if oldSlug == "" {
+		return nil, fmt.Errorf("no valid note reference found at cursor")
+	}
+
+	newTitle := params.NewName
+
+	// 2. Shell out to LX CLI
+	// This delegates the heavy lifting (updating backlinks) to the optimized CLI
+	cmd := exec.Command("lx", "rename", oldSlug, newTitle)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("lx rename failed: %s", string(output))
+	}
+
+	// 3. Return nil Edit
+	// Since 'lx rename' modifies the files on disk directly,
+	// we return an empty edit so the editor reloads from disk instead of applying text edits.
+	return &protocol.WorkspaceEdit{}, nil
 }
 
 // Handle DidOpen notification
@@ -80,6 +115,11 @@ func (s *LanguageServer) Completion(ctx context.Context, params *protocol.Comple
 	}
 
 	line := lines[params.Position.Line]
+	// Safety check for bounds
+	if int(params.Position.Character) > len(line) {
+		return &protocol.CompletionList{Items: []protocol.CompletionItem{}}, nil
+	}
+
 	linePrefix := line[:params.Position.Character]
 
 	var items []protocol.CompletionItem
@@ -182,7 +222,6 @@ func (s *LanguageServer) Definition(ctx context.Context, params *protocol.Defini
 		return nil, nil
 	}
 
-	// Read document and find slug at position
 	path := uriToPath(params.TextDocument.URI)
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -194,13 +233,11 @@ func (s *LanguageServer) Definition(ctx context.Context, params *protocol.Defini
 		return nil, nil
 	}
 
-	// Look up note in index
 	note, exists := s.index.Get(slug)
 	if !exists {
 		return nil, nil
 	}
 
-	// Return location of the note file
 	notePath := s.vault.GetNotePath(note.Filename)
 	uri := protocol.DocumentURI("file://" + notePath)
 
@@ -221,7 +258,6 @@ func (s *LanguageServer) Hover(ctx context.Context, params *protocol.HoverParams
 		return nil, nil
 	}
 
-	// Read document and find slug at position
 	path := uriToPath(params.TextDocument.URI)
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -233,13 +269,11 @@ func (s *LanguageServer) Hover(ctx context.Context, params *protocol.HoverParams
 		return nil, nil
 	}
 
-	// Look up note in index
 	note, exists := s.index.Get(slug)
 	if !exists {
 		return nil, nil
 	}
 
-	// Build markdown hover content
 	hoverText := fmt.Sprintf("**%s**\n\nSlug: `%s`\nDate: %s",
 		note.Title,
 		note.Slug,
@@ -272,10 +306,8 @@ func (s *LanguageServer) getSlugAtPosition(content string, pos protocol.Position
 	matches := refPattern.FindAllStringSubmatchIndex(line, -1)
 
 	for _, match := range matches {
-		// match[2] and match[3] are the start and end of the captured group
 		if int(pos.Character) >= match[2] && int(pos.Character) <= match[3] {
 			slug := line[match[2]:match[3]]
-			// Normalize slug (remove .tex, paths, etc.)
 			slug = strings.TrimSuffix(slug, ".tex")
 			slug = strings.TrimPrefix(slug, "../notes/")
 			return slug
@@ -300,15 +332,10 @@ func (s *LanguageServer) analyzeDiagnostics(content string) []protocol.Diagnosti
 	var diagnostics []protocol.Diagnostic
 
 	lines := strings.Split(content, "\n")
-
-	// Pattern for \ref{slug}
 	refPattern := regexp.MustCompile(`\\(?:ref|cite)\{([^}]+)\}`)
-
-	// Pattern for \todo{text}
 	todoPattern := regexp.MustCompile(`\\todo\{([^}]+)\}`)
 
 	for lineNum, line := range lines {
-		// Skip comment lines
 		if strings.HasPrefix(strings.TrimSpace(line), "%") {
 			continue
 		}
