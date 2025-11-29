@@ -1,0 +1,140 @@
+# This is an example .goreleaser.yml file with some sensible defaults.
+# Make sure to check the documentation at https://goreleaser.com
+
+# The lines below are called `modelines`. See `:help modeline`
+# Feel free to remove those if you don't want/need to use them.
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+version: 2
+
+before:
+    hooks:
+        # You may remove this if you don't use go modules.
+        - go mod tidy
+        # you may remove this if you don't need go generate
+        - go generate ./...
+
+builds:
+    - id: lx-lsp
+      main: ./main.go
+      binary: lx-lsp
+      env:
+          - CGO_ENABLED=0
+      goos:
+          - linux
+          - windows
+          - darwin
+      goarch:
+          - amd64
+          - arm64
+          - arm
+      goarm:
+          - "7"
+      ignore:
+          - goos: windows
+            goarch: arm
+          - goos: windows
+            goarch: arm64
+      ldflags:
+          - -s -w
+          - -X main.version={{.Version}}
+          - -X main.commit={{.Commit}}
+          - -X main.date={{.Date}}
+          - -X main.builtBy=goreleaser
+
+archives:
+    - id: lx-lsp-archive
+      name_template: >-
+          {{ .ProjectName }}_
+          {{- title .Os }}_
+          {{- if eq .Arch "amd64" }}x86_64
+          {{- else if eq .Arch "386" }}i386
+          {{- else }}{{ .Arch }}{{ end }}
+          {{- if .Arm }}v{{ .Arm }}{{ end }}
+      files:
+          - README.md
+          - LICENSE*
+
+checksum:
+    name_template: "checksums.txt"
+
+snapshot:
+    version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+    sort: asc
+    use: github
+    filters:
+        exclude:
+            - "^docs:"
+            - "^test:"
+            - "^chore"
+            - typo
+            - Merge pull request
+            - Merge remote-tracking branch
+            - Merge branch
+    groups:
+        - title: Features
+          regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+          order: 0
+        - title: "Bug fixes"
+          regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+          order: 1
+        - title: "Performance improvements"
+          regexp: '^.*?perf(\([[:word:]]+\))??!?:.+$'
+          order: 2
+        - title: Others
+          order: 999
+
+release:
+    github:
+        owner: kamal-hamza
+        name: lx-lsp
+    draft: false
+    prerelease: auto
+    mode: replace
+    header: |
+        ## lx-lsp {{ .Tag }} ({{ .Date }})
+
+        Welcome to this new release of lx-lsp!
+
+    footer: |
+        ## Installation
+
+        ### Using Go
+        ```bash
+        go install github.com/kamal-hamza/lx-lsp@{{ .Tag }}
+        ```
+
+        ### Download Binary
+        Download the appropriate binary for your platform from the assets below.
+
+        **Full Changelog**: https://github.com/kamal-hamza/lx-lsp/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+# Homebrew tap (optional - uncomment if you want to publish to a tap)
+# brews:
+#   - repository:
+#       owner: kamal-hamza
+#       name: homebrew-tap
+#     directory: Formula
+#     homepage: https://github.com/kamal-hamza/lx-lsp
+#     description: Language Server Protocol implementation for lx
+#     license: MIT
+#     test: |
+#       system "#{bin}/lx-lsp --version"
+#     install: |
+#       bin.install "lx-lsp"
+
+# Docker images (optional - uncomment if you want to publish Docker images)
+# dockers:
+#   - image_templates:
+#       - "ghcr.io/kamal-hamza/lx-lsp:{{ .Tag }}"
+#       - "ghcr.io/kamal-hamza/lx-lsp:latest"
+#     dockerfile: Dockerfile
+#     build_flag_templates:
+#       - "--pull"
+#       - "--label=org.opencontainers.image.created={{.Date}}"
+#       - "--label=org.opencontainers.image.title={{.ProjectName}}"
+#       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+#       - "--label=org.opencontainers.image.version={{.Version}}"
