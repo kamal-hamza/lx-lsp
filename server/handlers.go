@@ -172,6 +172,25 @@ func (s *LanguageServer) Completion(ctx context.Context, params *protocol.Comple
 		}
 	}
 
+	// Check for \includegraphics
+	imgPattern := regexp.MustCompile(`\\includegraphics(?:\[.*?\])?\{([^}]*)$`)
+	if matches := imgPattern.FindStringSubmatch(linePrefix); matches != nil {
+		prefix := matches[1]
+		assetItems := s.getAssetCompletions()
+
+		if prefix != "" {
+			filtered := []protocol.CompletionItem{}
+			for _, item := range assetItems {
+				if strings.HasPrefix(item.Label, prefix) {
+					filtered = append(filtered, item)
+				}
+			}
+			items = append(items, filtered...)
+		} else {
+			items = append(items, assetItems...)
+		}
+	}
+
 	// Add custom snippets when not inside a completion context
 	if len(items) == 0 {
 		items = append(items, s.getSnippetCompletions()...)
@@ -418,4 +437,28 @@ func (s *LanguageServer) analyzeDiagnostics(content string) []protocol.Diagnosti
 	}
 
 	return diagnostics
+}
+
+func (s *LanguageServer) getAssetCompletions() []protocol.CompletionItem {
+	// Read assets directory
+	entries, err := os.ReadDir(s.vault.AssetsPath)
+	if err != nil {
+		return []protocol.CompletionItem{}
+	}
+
+	var items []protocol.CompletionItem
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() == ".manifest.json" {
+			continue
+		}
+
+		// Create completion item
+		items = append(items, protocol.CompletionItem{
+			Label:      entry.Name(),
+			Kind:       protocol.CompletionItemKindFile,
+			Detail:     "Asset",
+			InsertText: entry.Name(),
+		})
+	}
+	return items
 }

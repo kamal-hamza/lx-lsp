@@ -64,6 +64,7 @@ func TestIsNoteManaged(t *testing.T) {
 			NotesPath:     notesPath,
 			TemplatesPath: templatesPath,
 		},
+		documents: make(map[protocol.DocumentURI]string),
 	}
 
 	tests := []struct {
@@ -137,18 +138,15 @@ func TestBuildIndex(t *testing.T) {
 		NotesPath: notesPath,
 	}
 
-	ls, err := NewLanguageServer()
-	if err != nil {
-		// Expected if vault not in standard location
-		// Create LS manually for test
-		ls = &LanguageServer{
-			vault: v,
-			index: NewIndex(),
-		}
+	// FIX: Explicitly create LS with the test vault to avoid picking up the real system vault
+	ls := &LanguageServer{
+		vault:     v,
+		index:     NewIndex(),
+		documents: make(map[protocol.DocumentURI]string),
 	}
 
 	// Action: Build index
-	err = ls.RebuildIndex(context.Background())
+	err := ls.RebuildIndex(context.Background())
 
 	// Assert
 	if err != nil {
@@ -171,7 +169,8 @@ func TestBuildIndex(t *testing.T) {
 // TestCompletion_References tests reference completion
 func TestCompletion_References(t *testing.T) {
 	ls := &LanguageServer{
-		index: NewIndex(),
+		index:     NewIndex(),
+		documents: make(map[protocol.DocumentURI]string),
 	}
 
 	// Add test notes to index
@@ -332,7 +331,8 @@ func TestDefinition(t *testing.T) {
 		vault: &vault.Vault{
 			NotesPath: notesPath,
 		},
-		index: NewIndex(),
+		index:     NewIndex(),
+		documents: make(map[protocol.DocumentURI]string),
 	}
 
 	ls.index.Set("graph-theory", &NoteHeader{
@@ -376,7 +376,8 @@ func TestDefinition(t *testing.T) {
 // TestHover tests hover information
 func TestHover(t *testing.T) {
 	ls := &LanguageServer{
-		index: NewIndex(),
+		index:     NewIndex(),
+		documents: make(map[protocol.DocumentURI]string),
 	}
 
 	ls.index.Set("graph-theory", &NoteHeader{
@@ -468,8 +469,9 @@ func TestRename(t *testing.T) {
 	}
 
 	ls := &LanguageServer{
-		vault: v,
-		index: NewIndex(),
+		vault:     v,
+		index:     NewIndex(),
+		documents: make(map[protocol.DocumentURI]string),
 	}
 
 	// Build index
@@ -519,7 +521,8 @@ func TestLiveIndexing_FileCreation(t *testing.T) {
 		vault: &vault.Vault{
 			NotesPath: notesPath,
 		},
-		index: NewIndex(),
+		index:     NewIndex(),
+		documents: make(map[protocol.DocumentURI]string),
 	}
 
 	// Initial index should be empty
@@ -570,7 +573,8 @@ func TestLiveIndexing_FileModification(t *testing.T) {
 		vault: &vault.Vault{
 			NotesPath: notesPath,
 		},
-		index: NewIndex(),
+		index:     NewIndex(),
+		documents: make(map[protocol.DocumentURI]string),
 	}
 
 	// Create initial file
@@ -624,7 +628,8 @@ func TestLiveIndexing_FileDeletion(t *testing.T) {
 		vault: &vault.Vault{
 			NotesPath: notesPath,
 		},
-		index: NewIndex(),
+		index:     NewIndex(),
+		documents: make(map[protocol.DocumentURI]string),
 	}
 
 	// Create and index a file
