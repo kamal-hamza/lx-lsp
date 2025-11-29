@@ -20,7 +20,7 @@ func (s *LanguageServer) Initialize(ctx context.Context, params *protocol.Initia
 				Change:    protocol.TextDocumentSyncKindFull,
 			},
 			CompletionProvider: &protocol.CompletionOptions{
-				TriggerCharacters: []string{"{", "\\"},
+				TriggerCharacters: []string{"{", "\\", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "-"},
 			},
 			DefinitionProvider: true,
 			HoverProvider:      true,
@@ -124,18 +124,48 @@ func (s *LanguageServer) Completion(ctx context.Context, params *protocol.Comple
 
 	var items []protocol.CompletionItem
 
-	// Check for \ref{ trigger
-	if strings.HasSuffix(linePrefix, "\\ref{") {
+	// Check if we're inside \ref{...} or just after \ref{
+	refPattern := regexp.MustCompile(`\\ref\{([^}]*)$`)
+	if matches := refPattern.FindStringSubmatch(linePrefix); matches != nil {
+		prefix := matches[1]
 		items = s.getRefCompletions()
+
+		// Filter completions based on what's already typed
+		if prefix != "" {
+			filtered := []protocol.CompletionItem{}
+			for _, item := range items {
+				if strings.HasPrefix(item.Label, prefix) {
+					filtered = append(filtered, item)
+				}
+			}
+			items = filtered
+		}
 	}
 
-	// Check for \usepackage{ trigger (templates)
-	if strings.HasSuffix(linePrefix, "\\usepackage{") {
-		items = s.getTemplateCompletions()
+	// Check if we're inside \usepackage{...} or just after \usepackage{
+	pkgPattern := regexp.MustCompile(`\\usepackage\{([^}]*)$`)
+	if matches := pkgPattern.FindStringSubmatch(linePrefix); matches != nil {
+		prefix := matches[1]
+		templateItems := s.getTemplateCompletions()
+
+		// Filter templates based on what's already typed
+		if prefix != "" {
+			filtered := []protocol.CompletionItem{}
+			for _, item := range templateItems {
+				if strings.HasPrefix(item.Label, prefix) {
+					filtered = append(filtered, item)
+				}
+			}
+			items = append(items, filtered...)
+		} else {
+			items = append(items, templateItems...)
+		}
 	}
 
-	// Add custom snippets
-	items = append(items, s.getSnippetCompletions()...)
+	// Add custom snippets when not inside a completion context
+	if len(items) == 0 {
+		items = append(items, s.getSnippetCompletions()...)
+	}
 
 	return &protocol.CompletionList{
 		IsIncomplete: false,
@@ -336,11 +366,12 @@ func (s *LanguageServer) analyzeDiagnostics(content string) []protocol.Diagnosti
 	todoPattern := regexp.MustCompile(`\\todo\{([^}]+)\}`)
 
 	for lineNum, line := range lines {
+		// Skip comment lines
 		if strings.HasPrefix(strings.TrimSpace(line), "%") {
 			continue
 		}
 
-		// Check for broken links
+		// Check for broken note references
 		refMatches := refPattern.FindAllStringSubmatchIndex(line, -1)
 		for _, match := range refMatches {
 			slug := line[match[2]:match[3]]

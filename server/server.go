@@ -2,16 +2,17 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/kamal-hamza/lx-cli/pkg/vault"
+	"github.com/kamal-hamza/lx-lsp/pkg/metadata"
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
 )
@@ -107,6 +108,7 @@ func (s *LanguageServer) Run(ctx context.Context) error {
 	)
 
 	conn := jsonrpc2.NewConn(stream)
+	conn.Go(ctx, s.handler())
 	s.conn = conn
 
 	// Build initial index
@@ -210,7 +212,7 @@ func (s *LanguageServer) listNoteHeaders(ctx context.Context) ([]*NoteHeader, er
 	return headers, nil
 }
 
-// parseNoteHeader extracts metadata from a note file
+// parseNoteHeader extracts metadata from a note file using robust metadata parser
 func (s *LanguageServer) parseNoteHeader(filename string) (*NoteHeader, error) {
 	path := s.vault.GetNotePath(filename)
 	content, err := os.ReadFile(path)
@@ -218,42 +220,35 @@ func (s *LanguageServer) parseNoteHeader(filename string) (*NoteHeader, error) {
 		return nil, err
 	}
 
+	// Use non-strict parser for reading existing files
+	// This allows recovery from minor metadata issues
+	meta, err := metadata.Extract(string(content))
+	if err != nil {
+		// Fallback: create minimal header from filename
+		slug := s.parseFilenameToSlug(filename)
+		return &NoteHeader{
+			Filename: filename,
+			Slug:     slug,
+			Title:    slug,
+			Date:     "",
+			Tags:     []string{},
+		}, nil
+	}
+
 	header := &NoteHeader{
 		Filename: filename,
 		Slug:     s.parseFilenameToSlug(filename),
-		Tags:     []string{},
+		Title:    meta.Title,
+		Date:     meta.Date,
+		Tags:     meta.Tags,
 	}
 
-	text := string(content)
-
-	// Parse title from % title: format
-	titleRe := regexp.MustCompile(`(?m)^%+\s*title:\s*(.+)$`)
-	if matches := titleRe.FindStringSubmatch(text); len(matches) > 1 {
-		header.Title = strings.TrimSpace(matches[1])
+	// Ensure tags is never nil
+	if header.Tags == nil {
+		header.Tags = []string{}
 	}
 
-	// Parse date from % date: format
-	dateRe := regexp.MustCompile(`(?m)^%+\s*date:\s*(.+)$`)
-	if matches := dateRe.FindStringSubmatch(text); len(matches) > 1 {
-		header.Date = strings.TrimSpace(matches[1])
-	}
-
-	// Parse tags from % tags: format (comma-separated)
-	tagsRe := regexp.MustCompile(`(?m)^%+\s*tags:\s*(.*)$`)
-	if matches := tagsRe.FindStringSubmatch(text); len(matches) > 1 {
-		tagsStr := strings.TrimSpace(matches[1])
-		if tagsStr != "" {
-			tags := strings.Split(tagsStr, ",")
-			for _, tag := range tags {
-				trimmed := strings.TrimSpace(tag)
-				if trimmed != "" {
-					header.Tags = append(header.Tags, trimmed)
-				}
-			}
-		}
-	}
-
-	// If no title found, use filename
+	// If no title found, use slug as fallback
 	if header.Title == "" {
 		header.Title = header.Slug
 	}
@@ -267,10 +262,20 @@ func (s *LanguageServer) parseFilenameToSlug(filename string) string {
 	// Remove .tex extension
 	name := strings.TrimSuffix(filename, ".tex")
 
-	// Find first hyphen (after date)
+	// Check if filename has date prefix (YYYYMMDD-slug format)
 	parts := strings.SplitN(name, "-", 2)
-	if len(parts) == 2 {
-		return parts[1]
+	if len(parts) == 2 && len(parts[0]) == 8 {
+		// Verify first part is all digits (a date)
+		allDigits := true
+		for _, ch := range parts[0] {
+			if ch < '0' || ch > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			return parts[1]
+		}
 	}
 
 	return name
@@ -311,4 +316,79 @@ func uriToPath(uri protocol.DocumentURI) string {
 		path = path[7:]
 	}
 	return path
+}
+
+// handler returns the JSON-RPC handler for LSP methods
+func (s *LanguageServer) handler() jsonrpc2.Handler {
+	return func(ctx context.Context, reply jsonrpc2.Replier, req jsonrpc2.Request) error {
+		switch req.Method() {
+		case protocol.MethodInitialize:
+			var params protocol.InitializeParams
+			if err := json.Unmarshal(req.Params(), &params); err != nil {
+				return reply(ctx, nil, err)
+			}
+			result, err := s.Initialize(ctx, &params)
+			return reply(ctx, result, err)
+
+		case protocol.MethodInitialized:
+			return reply(ctx, nil, nil)
+
+		case protocol.MethodTextDocumentDidOpen:
+			var params protocol.DidOpenTextDocumentParams
+			if err := json.Unmarshal(req.Params(), &params); err != nil {
+				return reply(ctx, nil, err)
+			}
+			err := s.DidOpen(ctx, &params)
+			return reply(ctx, nil, err)
+
+		case protocol.MethodTextDocumentDidChange:
+			var params protocol.DidChangeTextDocumentParams
+			if err := json.Unmarshal(req.Params(), &params); err != nil {
+				return reply(ctx, nil, err)
+			}
+			err := s.DidChange(ctx, &params)
+			return reply(ctx, nil, err)
+
+		case protocol.MethodTextDocumentCompletion:
+			var params protocol.CompletionParams
+			if err := json.Unmarshal(req.Params(), &params); err != nil {
+				return reply(ctx, nil, err)
+			}
+			result, err := s.Completion(ctx, &params)
+			return reply(ctx, result, err)
+
+		case protocol.MethodTextDocumentDefinition:
+			var params protocol.DefinitionParams
+			if err := json.Unmarshal(req.Params(), &params); err != nil {
+				return reply(ctx, nil, err)
+			}
+			result, err := s.Definition(ctx, &params)
+			return reply(ctx, result, err)
+
+		case protocol.MethodTextDocumentHover:
+			var params protocol.HoverParams
+			if err := json.Unmarshal(req.Params(), &params); err != nil {
+				return reply(ctx, nil, err)
+			}
+			result, err := s.Hover(ctx, &params)
+			return reply(ctx, result, err)
+
+		case protocol.MethodTextDocumentRename:
+			var params protocol.RenameParams
+			if err := json.Unmarshal(req.Params(), &params); err != nil {
+				return reply(ctx, nil, err)
+			}
+			result, err := s.Rename(ctx, &params)
+			return reply(ctx, result, err)
+
+		case protocol.MethodShutdown:
+			return reply(ctx, nil, nil)
+
+		case protocol.MethodExit:
+			return nil
+
+		default:
+			return reply(ctx, nil, jsonrpc2.ErrMethodNotFound)
+		}
+	}
 }
