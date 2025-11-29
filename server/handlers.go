@@ -20,18 +20,18 @@ func (s *LanguageServer) Initialize(ctx context.Context, params *protocol.Initia
 				Change:    protocol.TextDocumentSyncKindFull,
 			},
 			CompletionProvider: &protocol.CompletionOptions{
-				TriggerCharacters: []string{"{", "\\"},
+				TriggerCharacters: []string{"{", "\\", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "-"},
 			},
 			DefinitionProvider: true,
 			HoverProvider:      true,
-			RenameProvider:     true, // <--- Enabled Rename
+			RenameProvider:     true,
 			DocumentLinkProvider: &protocol.DocumentLinkOptions{
 				ResolveProvider: false,
 			},
 		},
 		ServerInfo: &protocol.ServerInfo{
 			Name:    "lx-ls",
-			Version: "0.1.0",
+			Version: "0.1.1",
 		},
 	}, nil
 }
@@ -42,30 +42,25 @@ func (s *LanguageServer) Rename(ctx context.Context, params *protocol.RenamePara
 		return nil, nil
 	}
 
-	// 1. Identify the slug being renamed
-	path := uriToPath(params.TextDocument.URI)
-	content, err := os.ReadFile(path)
+	content, err := s.GetDocument(params.TextDocument.URI)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
 
-	oldSlug := s.getSlugAtPosition(string(content), params.Position)
+	oldSlug := s.getSlugAtPosition(content, params.Position)
 	if oldSlug == "" {
 		return nil, fmt.Errorf("no valid note reference found at cursor")
 	}
 
 	newTitle := params.NewName
 
-	// 2. Shell out to LX CLI
-	// This delegates the heavy lifting (updating backlinks) to the optimized CLI
+	// Shell out to LX CLI
 	cmd := exec.Command("lx", "rename", oldSlug, newTitle)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("lx rename failed: %s", string(output))
 	}
 
-	// 3. Return nil Edit
-	// Since 'lx rename' modifies the files on disk directly,
-	// we return an empty edit so the editor reloads from disk instead of applying text edits.
+	// Return nil edit so editor reloads from disk
 	return &protocol.WorkspaceEdit{}, nil
 }
 
@@ -74,6 +69,11 @@ func (s *LanguageServer) DidOpen(ctx context.Context, params *protocol.DidOpenTe
 	if !s.IsManaged(params.TextDocument.URI) {
 		return nil
 	}
+
+	// Store document in memory
+	s.mu.Lock()
+	s.documents[params.TextDocument.URI] = params.TextDocument.Text
+	s.mu.Unlock()
 
 	// Run diagnostics
 	return s.publishDiagnostics(ctx, params.TextDocument.URI, params.TextDocument.Text)
@@ -85,15 +85,28 @@ func (s *LanguageServer) DidChange(ctx context.Context, params *protocol.DidChan
 		return nil
 	}
 
-	// Get the latest content
 	if len(params.ContentChanges) == 0 {
 		return nil
 	}
 
 	text := params.ContentChanges[0].Text
 
+	// Update document in memory
+	s.mu.Lock()
+	s.documents[params.TextDocument.URI] = text
+	s.mu.Unlock()
+
 	// Run diagnostics
 	return s.publishDiagnostics(ctx, params.TextDocument.URI, text)
+}
+
+// Handle DidClose notification
+func (s *LanguageServer) DidClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
+	// Remove from memory to prevent leaks
+	s.mu.Lock()
+	delete(s.documents, params.TextDocument.URI)
+	s.mu.Unlock()
+	return nil
 }
 
 // Handle Completion request
@@ -102,20 +115,18 @@ func (s *LanguageServer) Completion(ctx context.Context, params *protocol.Comple
 		return &protocol.CompletionList{Items: []protocol.CompletionItem{}}, nil
 	}
 
-	// Read current document
-	path := uriToPath(params.TextDocument.URI)
-	content, err := os.ReadFile(path)
+	// Read content from memory (this now includes the just-typed '{')
+	content, err := s.GetDocument(params.TextDocument.URI)
 	if err != nil {
 		return &protocol.CompletionList{Items: []protocol.CompletionItem{}}, nil
 	}
 
-	lines := strings.Split(string(content), "\n")
+	lines := strings.Split(content, "\n")
 	if int(params.Position.Line) >= len(lines) {
 		return &protocol.CompletionList{Items: []protocol.CompletionItem{}}, nil
 	}
 
 	line := lines[params.Position.Line]
-	// Safety check for bounds
 	if int(params.Position.Character) > len(line) {
 		return &protocol.CompletionList{Items: []protocol.CompletionItem{}}, nil
 	}
@@ -124,18 +135,47 @@ func (s *LanguageServer) Completion(ctx context.Context, params *protocol.Comple
 
 	var items []protocol.CompletionItem
 
-	// Check for \ref{ trigger
-	if strings.HasSuffix(linePrefix, "\\ref{") {
+	// Check if we're inside \ref{...}
+	refPattern := regexp.MustCompile(`\\ref\{([^}]*)$`)
+	if matches := refPattern.FindStringSubmatch(linePrefix); matches != nil {
+		prefix := matches[1]
 		items = s.getRefCompletions()
+
+		// Filter completions based on what's already typed
+		if prefix != "" {
+			filtered := []protocol.CompletionItem{}
+			for _, item := range items {
+				if strings.HasPrefix(item.Label, prefix) {
+					filtered = append(filtered, item)
+				}
+			}
+			items = filtered
+		}
 	}
 
-	// Check for \usepackage{ trigger (templates)
-	if strings.HasSuffix(linePrefix, "\\usepackage{") {
-		items = s.getTemplateCompletions()
+	// Check if we're inside \usepackage{...}
+	pkgPattern := regexp.MustCompile(`\\usepackage\{([^}]*)$`)
+	if matches := pkgPattern.FindStringSubmatch(linePrefix); matches != nil {
+		prefix := matches[1]
+		templateItems := s.getTemplateCompletions()
+
+		if prefix != "" {
+			filtered := []protocol.CompletionItem{}
+			for _, item := range templateItems {
+				if strings.HasPrefix(item.Label, prefix) {
+					filtered = append(filtered, item)
+				}
+			}
+			items = append(items, filtered...)
+		} else {
+			items = append(items, templateItems...)
+		}
 	}
 
-	// Add custom snippets
-	items = append(items, s.getSnippetCompletions()...)
+	// Add custom snippets when not inside a completion context
+	if len(items) == 0 {
+		items = append(items, s.getSnippetCompletions()...)
+	}
 
 	return &protocol.CompletionList{
 		IsIncomplete: false,
@@ -222,13 +262,12 @@ func (s *LanguageServer) Definition(ctx context.Context, params *protocol.Defini
 		return nil, nil
 	}
 
-	path := uriToPath(params.TextDocument.URI)
-	content, err := os.ReadFile(path)
+	content, err := s.GetDocument(params.TextDocument.URI)
 	if err != nil {
 		return nil, nil
 	}
 
-	slug := s.getSlugAtPosition(string(content), params.Position)
+	slug := s.getSlugAtPosition(content, params.Position)
 	if slug == "" {
 		return nil, nil
 	}
@@ -258,13 +297,12 @@ func (s *LanguageServer) Hover(ctx context.Context, params *protocol.HoverParams
 		return nil, nil
 	}
 
-	path := uriToPath(params.TextDocument.URI)
-	content, err := os.ReadFile(path)
+	content, err := s.GetDocument(params.TextDocument.URI)
 	if err != nil {
 		return nil, nil
 	}
 
-	slug := s.getSlugAtPosition(string(content), params.Position)
+	slug := s.getSlugAtPosition(content, params.Position)
 	if slug == "" {
 		return nil, nil
 	}
@@ -307,7 +345,9 @@ func (s *LanguageServer) getSlugAtPosition(content string, pos protocol.Position
 
 	for _, match := range matches {
 		if int(pos.Character) >= match[2] && int(pos.Character) <= match[3] {
-			slug := line[match[2]:match[3]]
+			rawSlug := line[match[2]:match[3]]
+			// Normalize
+			slug := strings.TrimSpace(rawSlug)
 			slug = strings.TrimSuffix(slug, ".tex")
 			slug = strings.TrimPrefix(slug, "../notes/")
 			return slug
@@ -336,14 +376,16 @@ func (s *LanguageServer) analyzeDiagnostics(content string) []protocol.Diagnosti
 	todoPattern := regexp.MustCompile(`\\todo\{([^}]+)\}`)
 
 	for lineNum, line := range lines {
+		// Skip comment lines
 		if strings.HasPrefix(strings.TrimSpace(line), "%") {
 			continue
 		}
 
-		// Check for broken links
+		// Check for broken note references
 		refMatches := refPattern.FindAllStringSubmatchIndex(line, -1)
 		for _, match := range refMatches {
-			slug := line[match[2]:match[3]]
+			rawSlug := line[match[2]:match[3]]
+			slug := strings.TrimSpace(rawSlug)
 			slug = strings.TrimSuffix(slug, ".tex")
 
 			if _, exists := s.index.Get(slug); !exists {

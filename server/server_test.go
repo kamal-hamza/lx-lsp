@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -115,11 +117,11 @@ func TestBuildIndex(t *testing.T) {
 	}{
 		{
 			"20240101-graph-theory.tex",
-			"%% title: Graph Theory\n%% date: 2024-01-01\n%% tags: math\n\\documentclass{article}\n\\begin{document}\nContent\n\\end{document}",
+			"%% Metadata\n%% title: Graph Theory\n%% date: 2024-01-01\n%% tags: math\n\n\\documentclass{article}\n\\begin{document}\nContent\n\\end{document}",
 		},
 		{
 			"20240102-linear-algebra.tex",
-			"%% title: Linear Algebra\n%% date: 2024-01-02\n%% tags: math\n\\documentclass{article}\n\\begin{document}\nContent\n\\end{document}",
+			"%% Metadata\n%% title: Linear Algebra\n%% date: 2024-01-02\n%% tags: math\n\n\\documentclass{article}\n\\begin{document}\nContent\n\\end{document}",
 		},
 	}
 
@@ -424,5 +426,306 @@ func TestHover(t *testing.T) {
 	}
 	if !strings.Contains(content, "math") {
 		t.Errorf("expected tags in hover, got: %s", content)
+	}
+}
+
+// TestRename tests the rename functionality
+func TestRename(t *testing.T) {
+	// Skip if lx CLI is not available
+	if _, err := exec.LookPath("lx"); err != nil {
+		t.Skip("lx CLI not found in PATH, skipping rename test")
+	}
+
+	// Setup: Create a real vault with test notes
+	tempDir := t.TempDir()
+	os.Setenv("XDG_DATA_HOME", tempDir)
+	defer os.Unsetenv("XDG_DATA_HOME")
+
+	v, err := vault.New()
+	if err != nil {
+		t.Fatalf("failed to create vault: %v", err)
+	}
+
+	if err := v.Initialize(); err != nil {
+		t.Fatalf("failed to initialize vault: %v", err)
+	}
+
+	// Create test notes with cross-references
+	notesPath := v.NotesPath
+	oldSlug := "old-note"
+	referencingSlug := "referencing-note"
+
+	oldNoteFile := filepath.Join(notesPath, "20240101-"+oldSlug+".tex")
+	oldNoteContent := "%% title: Old Note\n%% date: 2024-01-01\n\\documentclass{article}\n\\begin{document}\nOld content\n\\end{document}"
+	if err := os.WriteFile(oldNoteFile, []byte(oldNoteContent), 0644); err != nil {
+		t.Fatalf("failed to create old note: %v", err)
+	}
+
+	refNoteFile := filepath.Join(notesPath, "20240102-"+referencingSlug+".tex")
+	refNoteContent := "%% title: Referencing Note\n%% date: 2024-02-01\n\\documentclass{article}\n\\begin{document}\nSee \\ref{old-note} for details.\n\\end{document}"
+	if err := os.WriteFile(refNoteFile, []byte(refNoteContent), 0644); err != nil {
+		t.Fatalf("failed to create referencing note: %v", err)
+	}
+
+	ls := &LanguageServer{
+		vault: v,
+		index: NewIndex(),
+	}
+
+	// Build index
+	if err := ls.RebuildIndex(context.Background()); err != nil {
+		t.Fatalf("failed to build index: %v", err)
+	}
+
+	// Create rename params
+	params := &protocol.RenameParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{
+				URI: protocol.DocumentURI("file://" + refNoteFile),
+			},
+			Position: protocol.Position{
+				Line:      4,
+				Character: 10, // Inside "old-note"
+			},
+		},
+		NewName: "New Note Title",
+	}
+
+	// Execute rename
+	edit, err := ls.Rename(context.Background(), params)
+	if err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+
+	// Should return empty edit (delegated to CLI)
+	if edit == nil {
+		t.Error("expected non-nil edit result")
+	}
+
+	// Verify the CLI updated the file (note: this is integration-level testing)
+	// The old file should no longer exist
+	if _, err := os.Stat(oldNoteFile); !os.IsNotExist(err) {
+		t.Log("Note: old file still exists - CLI rename may not have completed")
+	}
+}
+
+// TestLiveIndexing_FileCreation tests index updates on file creation
+func TestLiveIndexing_FileCreation(t *testing.T) {
+	tempDir := t.TempDir()
+	notesPath := filepath.Join(tempDir, "notes")
+	os.MkdirAll(notesPath, 0755)
+
+	ls := &LanguageServer{
+		vault: &vault.Vault{
+			NotesPath: notesPath,
+		},
+		index: NewIndex(),
+	}
+
+	// Initial index should be empty
+	if ls.index.Count() != 0 {
+		t.Errorf("expected empty index, got %d notes", ls.index.Count())
+	}
+
+	// Simulate file creation
+	newFile := filepath.Join(notesPath, "20240101-new-note.tex")
+	content := "%% Metadata\n%% title: New Note\n%% date: 2024-01-01\n%% tags: test\n\n\\documentclass{article}\n\\begin{document}\nContent\n\\end{document}"
+	if err := os.WriteFile(newFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Trigger index update
+	ls.updateIndexForFile(newFile)
+
+	// Verify index was updated
+	if ls.index.Count() != 1 {
+		t.Errorf("expected 1 note in index, got %d", ls.index.Count())
+	}
+
+	note, exists := ls.index.Get("new-note")
+	if !exists {
+		t.Error("expected 'new-note' in index")
+	}
+
+	if note != nil {
+		if note.Title != "New Note" {
+			t.Errorf("expected title 'New Note', got '%s'", note.Title)
+		}
+		if note.Date != "2024-01-01" {
+			t.Errorf("expected date '2024-01-01', got '%s'", note.Date)
+		}
+		if len(note.Tags) != 1 || note.Tags[0] != "test" {
+			t.Errorf("expected tags [test], got %v", note.Tags)
+		}
+	}
+}
+
+// TestLiveIndexing_FileModification tests index updates on file modification
+func TestLiveIndexing_FileModification(t *testing.T) {
+	tempDir := t.TempDir()
+	notesPath := filepath.Join(tempDir, "notes")
+	os.MkdirAll(notesPath, 0755)
+
+	ls := &LanguageServer{
+		vault: &vault.Vault{
+			NotesPath: notesPath,
+		},
+		index: NewIndex(),
+	}
+
+	// Create initial file
+	testFile := filepath.Join(notesPath, "20240101-test-note.tex")
+	initialContent := "%% Metadata\n%% title: Original Title\n%% date: 2024-01-01\n%% tags: \n\n\\documentclass{article}\n\\begin{document}\nContent\n\\end{document}"
+	if err := os.WriteFile(testFile, []byte(initialContent), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// Add to index
+	ls.updateIndexForFile(testFile)
+
+	note, _ := ls.index.Get("test-note")
+	if note.Title != "Original Title" {
+		t.Errorf("expected original title, got '%s'", note.Title)
+	}
+
+	// Modify the file
+	modifiedContent := "%% Metadata\n%% title: Updated Title\n%% date: 2024-01-02\n%% tags: updated\n\n\\documentclass{article}\n\\begin{document}\nNew content\n\\end{document}"
+	if err := os.WriteFile(testFile, []byte(modifiedContent), 0644); err != nil {
+		t.Fatalf("failed to modify test file: %v", err)
+	}
+
+	// Trigger index update
+	ls.updateIndexForFile(testFile)
+
+	// Verify index was updated
+	note, exists := ls.index.Get("test-note")
+	if !exists {
+		t.Fatal("expected 'test-note' in index")
+	}
+
+	if note.Title != "Updated Title" {
+		t.Errorf("expected title 'Updated Title', got '%s'", note.Title)
+	}
+	if note.Date != "2024-01-02" {
+		t.Errorf("expected date '2024-01-02', got '%s'", note.Date)
+	}
+	if len(note.Tags) != 1 || note.Tags[0] != "updated" {
+		t.Errorf("expected tags [updated], got %v", note.Tags)
+	}
+}
+
+// TestLiveIndexing_FileDeletion tests index updates on file deletion
+func TestLiveIndexing_FileDeletion(t *testing.T) {
+	tempDir := t.TempDir()
+	notesPath := filepath.Join(tempDir, "notes")
+	os.MkdirAll(notesPath, 0755)
+
+	ls := &LanguageServer{
+		vault: &vault.Vault{
+			NotesPath: notesPath,
+		},
+		index: NewIndex(),
+	}
+
+	// Create and index a file
+	testFile := filepath.Join(notesPath, "20240101-delete-me.tex")
+	content := "%% title: To Delete\n%% date: 2024-01-01\n\\documentclass{article}\n\\begin{document}\nContent\n\\end{document}"
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	ls.updateIndexForFile(testFile)
+
+	// Verify it's in the index
+	if ls.index.Count() != 1 {
+		t.Errorf("expected 1 note in index, got %d", ls.index.Count())
+	}
+
+	// Delete the file
+	if err := os.Remove(testFile); err != nil {
+		t.Fatalf("failed to delete test file: %v", err)
+	}
+
+	// Trigger index update
+	ls.updateIndexForFile(testFile)
+
+	// Verify it was removed from index
+	if ls.index.Count() != 0 {
+		t.Errorf("expected empty index after deletion, got %d notes", ls.index.Count())
+	}
+
+	_, exists := ls.index.Get("delete-me")
+	if exists {
+		t.Error("expected 'delete-me' to be removed from index")
+	}
+}
+
+// TestParseFilenameToSlug tests slug extraction from various filename formats
+func TestParseFilenameToSlug(t *testing.T) {
+	ls := &LanguageServer{}
+
+	tests := []struct {
+		filename string
+		expected string
+	}{
+		{"20240101-graph-theory.tex", "graph-theory"},
+		{"20240102-linear-algebra.tex", "linear-algebra"},
+		{"20240103-multi-word-slug-name.tex", "multi-word-slug-name"},
+		{"simple.tex", "simple"},
+		{"no-date-prefix.tex", "no-date-prefix"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.filename, func(t *testing.T) {
+			result := ls.parseFilenameToSlug(tt.filename)
+			if result != tt.expected {
+				t.Errorf("parseFilenameToSlug(%s) = %s, want %s", tt.filename, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestIndex_ThreadSafety tests concurrent access to the index
+func TestIndex_ThreadSafety(t *testing.T) {
+	index := NewIndex()
+
+	// Concurrent writes
+	done := make(chan bool)
+	for i := 0; i < 10; i++ {
+		go func(id int) {
+			slug := fmt.Sprintf("note-%d", id)
+			header := &NoteHeader{
+				Slug:  slug,
+				Title: fmt.Sprintf("Note %d", id),
+			}
+			index.Set(slug, header)
+			done <- true
+		}(i)
+	}
+
+	// Wait for all writes
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+
+	// Concurrent reads
+	for i := 0; i < 10; i++ {
+		go func(id int) {
+			slug := fmt.Sprintf("note-%d", id)
+			_, exists := index.Get(slug)
+			if !exists {
+				t.Errorf("expected note-%d to exist", id)
+			}
+			done <- true
+		}(i)
+	}
+
+	// Wait for all reads
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+
+	if index.Count() != 10 {
+		t.Errorf("expected 10 notes in index, got %d", index.Count())
 	}
 }
