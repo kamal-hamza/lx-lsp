@@ -27,11 +27,12 @@ type NoteHeader struct {
 }
 
 type LanguageServer struct {
-	vault   *vault.Vault
-	index   *Index
-	conn    jsonrpc2.Conn
-	watcher *fsnotify.Watcher // <--- Added Watcher
-	mu      sync.RWMutex
+	vault     *vault.Vault
+	index     *Index
+	conn      jsonrpc2.Conn
+	watcher   *fsnotify.Watcher
+	documents map[protocol.DocumentURI]string // <--- In-memory document store
+	mu        sync.RWMutex
 }
 
 type Index struct {
@@ -93,9 +94,29 @@ func NewLanguageServer() (*LanguageServer, error) {
 	}
 
 	return &LanguageServer{
-		vault: v,
-		index: NewIndex(),
+		vault:     v,
+		index:     NewIndex(),
+		documents: make(map[protocol.DocumentURI]string), // <--- Initialize map
 	}, nil
+}
+
+// GetDocument returns the content of a document (from memory or disk)
+func (s *LanguageServer) GetDocument(uri protocol.DocumentURI) (string, error) {
+	s.mu.RLock()
+	content, ok := s.documents[uri]
+	s.mu.RUnlock()
+
+	if ok {
+		return content, nil
+	}
+
+	// Fallback to disk if not open
+	path := uriToPath(uri)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func (s *LanguageServer) Run(ctx context.Context) error {
@@ -312,8 +333,12 @@ func (s *LanguageServer) IsManaged(uri protocol.DocumentURI) bool {
 func uriToPath(uri protocol.DocumentURI) string {
 	path := string(uri)
 	// Remove file:// prefix
-	if strings.TrimPrefix(path, "file://") != "" {
-		path = path[7:]
+	if strings.HasPrefix(path, "file://") {
+		path = strings.TrimPrefix(path, "file://")
+	}
+	// Handle Windows paths like /C:/Users... -> C:/Users...
+	if len(path) > 2 && path[0] == '/' && path[2] == ':' {
+		path = path[1:]
 	}
 	return path
 }
@@ -347,6 +372,14 @@ func (s *LanguageServer) handler() jsonrpc2.Handler {
 				return reply(ctx, nil, err)
 			}
 			err := s.DidChange(ctx, &params)
+			return reply(ctx, nil, err)
+
+		case protocol.MethodTextDocumentDidClose: // <--- Handle DidClose to free memory
+			var params protocol.DidCloseTextDocumentParams
+			if err := json.Unmarshal(req.Params(), &params); err != nil {
+				return reply(ctx, nil, err)
+			}
+			err := s.DidClose(ctx, &params)
 			return reply(ctx, nil, err)
 
 		case protocol.MethodTextDocumentCompletion:
